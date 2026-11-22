@@ -273,7 +273,10 @@ impl DatabaseManager {
         let archive_path = self
             .backup_dir
             .join(format!("legacy-messages-{timestamp}.jsonl"));
-        if tokio::fs::rename(messages_path, &archive_path).await.is_ok() {
+        if tokio::fs::rename(messages_path, &archive_path)
+            .await
+            .is_ok()
+        {
             if let Err(error) = tokio::fs::write(messages_path, "").await {
                 tracing::warn!("重置 messages.jsonl 失败: {error}");
             } else {
@@ -336,7 +339,9 @@ impl DatabaseManager {
         for (task_id, task) in latest {
             let record_id = task.id.to_string();
             remember_persisted_task(&mut state, &task, None, None);
-            state.task_id_to_record_id.insert(task_id, record_id.clone());
+            state
+                .task_id_to_record_id
+                .insert(task_id, record_id.clone());
             state.tasks.insert(record_id, task);
         }
         if duplicate_count > 0 {
@@ -387,10 +392,9 @@ impl DatabaseManager {
                 tracing::warn!("解析系统信息行失败: {line}");
                 continue;
             };
-            if let (Some(key), Some(value)) = (
-                info.get("key").and_then(Value::as_str),
-                info.get("value"),
-            ) {
+            if let (Some(key), Some(value)) =
+                (info.get("key").and_then(Value::as_str), info.get("value"))
+            {
                 state.system_info.insert(key.to_string(), value.clone());
             }
         }
@@ -406,7 +410,9 @@ impl DatabaseManager {
                 continue;
             };
             if let Some(id) = config.get("id").and_then(Value::as_str) {
-                state.scheduled_exports.insert(id.to_string(), config.clone());
+                state
+                    .scheduled_exports
+                    .insert(id.to_string(), config.clone());
             }
         }
         Ok(())
@@ -546,7 +552,8 @@ impl DatabaseManager {
 
         if should_persist {
             let record_value = serde_json::to_value(&record)?;
-            self.queue_write(self.files.tasks.clone(), record_value).await;
+            self.queue_write(self.files.tasks.clone(), record_value)
+                .await;
         }
         Ok(())
     }
@@ -579,11 +586,7 @@ impl DatabaseManager {
             results.push((config, task_state));
         }
         results.sort_by_key(|(_, task_state)| {
-            std::cmp::Reverse(
-                task_state
-                    .get("startTime")
-                    .map_or(0, to_timestamp),
-            )
+            std::cmp::Reverse(task_state.get("startTime").map_or(0, to_timestamp))
         });
         results
     }
@@ -593,13 +596,17 @@ impl DatabaseManager {
         self.flush_write_queue().await?;
         {
             let mut state = self.state.lock().await;
-            let record_id = state.task_id_to_record_id.get(task_id).cloned().or_else(|| {
-                state
-                    .tasks
-                    .iter()
-                    .find(|(_, record)| record.task_id == task_id)
-                    .map(|(record_id, _)| record_id.clone())
-            });
+            let record_id = state
+                .task_id_to_record_id
+                .get(task_id)
+                .cloned()
+                .or_else(|| {
+                    state
+                        .tasks
+                        .iter()
+                        .find(|(_, record)| record.task_id == task_id)
+                        .map(|(record_id, _)| record_id.clone())
+                });
             if let Some(record_id) = record_id {
                 state.tasks.remove(&record_id);
                 state.task_id_to_record_id.remove(task_id);
@@ -676,7 +683,14 @@ impl DatabaseManager {
                             .get("status")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        if (status == "pending" || status == "running") && progress == 0 {
+                        let has_checkpoint = task_state
+                            .pointer("/fetchCheckpoint/version")
+                            .and_then(Value::as_u64)
+                            == Some(1);
+                        if (status == "pending" || status == "running")
+                            && progress == 0
+                            && !has_checkpoint
+                        {
                             if let Some(task_id) = config.get("taskId").and_then(Value::as_str) {
                                 to_delete.push(task_id.to_string());
                             }
@@ -695,13 +709,17 @@ impl DatabaseManager {
         {
             let mut state = self.state.lock().await;
             for task_id in &tasks_to_delete {
-                let record_id = state.task_id_to_record_id.get(task_id).cloned().or_else(|| {
-                    state
-                        .tasks
-                        .iter()
-                        .find(|(_, record)| record.task_id == *task_id)
-                        .map(|(record_id, _)| record_id.clone())
-                });
+                let record_id = state
+                    .task_id_to_record_id
+                    .get(task_id)
+                    .cloned()
+                    .or_else(|| {
+                        state
+                            .tasks
+                            .iter()
+                            .find(|(_, record)| record.task_id == *task_id)
+                            .map(|(record_id, _)| record_id.clone())
+                    });
                 if let Some(record_id) = record_id {
                     state.tasks.remove(&record_id);
                     state.task_id_to_record_id.remove(task_id);
@@ -723,7 +741,8 @@ impl DatabaseManager {
             let mut state = self.state.lock().await;
             state.system_info.insert(key.to_string(), json!(value));
         }
-        self.queue_write(self.files.system_info.clone(), record).await;
+        self.queue_write(self.files.system_info.clone(), record)
+            .await;
     }
 
     /// 获取系统信息。
@@ -815,9 +834,7 @@ impl DatabaseManager {
         self.state.lock().await.initialized
     }
 
-
     // 资源管理
-
 
     /// 保存资源信息（带去抖）。
     pub async fn save_resource_info(&self, resource: &ResourceInfo) -> Result<(), DatabaseError> {
@@ -841,7 +858,10 @@ impl DatabaseManager {
         if should_persist {
             let mut record = serde_json::to_value(&normalized)?;
             if let Some(obj) = record.as_object_mut() {
-                obj.insert("accessible".to_string(), json!(i32::from(normalized.accessible)));
+                obj.insert(
+                    "accessible".to_string(),
+                    json!(i32::from(normalized.accessible)),
+                );
                 obj.insert("created_at".to_string(), json!(now_iso()));
                 obj.insert("updated_at".to_string(), json!(now_iso()));
             }
@@ -881,7 +901,10 @@ impl DatabaseManager {
             .values()
             .filter(|resource| {
                 resource.status == "downloaded"
-                    && resource.local_path.as_deref().is_some_and(|p| !p.is_empty())
+                    && resource
+                        .local_path
+                        .as_deref()
+                        .is_some_and(|p| !p.is_empty())
                     && to_timestamp(&resource.checked_at) <= cutoff_ms
             })
             .cloned()
@@ -946,9 +969,7 @@ impl DatabaseManager {
         })
     }
 
-
     // 定时导出 / 执行历史
-
 
     /// 保存定时导出任务。
     pub async fn save_scheduled_export(&self, config: &Value) -> Result<(), DatabaseError> {
@@ -1026,7 +1047,11 @@ impl DatabaseManager {
     }
 
     /// 获取执行历史（最近 `limit` 条，倒序）。
-    pub async fn get_execution_history(&self, scheduled_export_id: &str, limit: usize) -> Vec<Value> {
+    pub async fn get_execution_history(
+        &self,
+        scheduled_export_id: &str,
+        limit: usize,
+    ) -> Vec<Value> {
         let state = self.state.lock().await;
         let Some(history) = state.execution_history.get(scheduled_export_id) else {
             return Vec::new();
@@ -1151,7 +1176,10 @@ fn should_persist_task(
     if snapshot.state_signature == state_signature {
         return false;
     }
-    let status = task_state.get("status").and_then(Value::as_str).unwrap_or("");
+    let status = task_state
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if snapshot.status != status {
         return true;
     }
@@ -1337,7 +1365,11 @@ fn should_compact_resource_file(
     if live_count == 0 {
         return false;
     }
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     // 记录数远小于 2^52，损失可忽略
     let threshold = (live_count as f64 * RESOURCE_REBUILD_DUPLICATE_RATIO).ceil() as usize;
     loaded_count >= threshold
@@ -1354,9 +1386,7 @@ fn normalize_checked_at(resource: &mut ResourceInfo) {
 /// 将 Date / ISO 字符串 / 毫秒数转换成毫秒时间戳，无效时返回 0。
 fn to_timestamp(value: &Value) -> i64 {
     match value {
-        Value::String(s) => {
-            DateTime::parse_from_rfc3339(s).map_or(0, |dt| dt.timestamp_millis())
-        }
+        Value::String(s) => DateTime::parse_from_rfc3339(s).map_or(0, |dt| dt.timestamp_millis()),
         Value::Number(n) => n.as_i64().unwrap_or(0),
         _ => 0,
     }
@@ -1371,8 +1401,9 @@ fn normalize_date_value(value: Option<&Value>) -> Value {
     if ts == 0 {
         return Value::Null;
     }
-    DateTime::<Utc>::from_timestamp_millis(ts)
-        .map_or(Value::Null, |dt| json!(dt.to_rfc3339_opts(SecondsFormat::Millis, true)))
+    DateTime::<Utc>::from_timestamp_millis(ts).map_or(Value::Null, |dt| {
+        json!(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
+    })
 }
 
 /// 当前 UTC 时间 ISO 字符串（毫秒精度，与 JS `toISOString()` 对齐）。

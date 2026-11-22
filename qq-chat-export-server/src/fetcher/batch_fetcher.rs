@@ -212,6 +212,16 @@ pub enum FetchError {
     /// 底层 API 错误。
     #[error("{0}")]
     Api(String),
+    /// QQ returned a business error inside an otherwise successful RPC.
+    #[error("原生消息查询失败 result={code}: {message}")]
+    Native { code: i64, message: String },
+    /// Preserve a valid main page when its boundary cannot be confirmed.
+    #[error("边界补读失败（待重试序号 {resume_seq}）: {error}")]
+    PartialPage {
+        messages: Vec<Value>,
+        resume_seq: String,
+        error: Box<FetchError>,
+    },
     /// 主动修复未取得进展。
     #[error(
         "MESSAGE_SEQUENCE_REPAIR_NO_PROGRESS: 群聊历史仍有 {gap_count} 个大序列缺口（估算缺失 {missing_positions} 个序号）"
@@ -249,6 +259,24 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    #[must_use]
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::Native {
+                code: 2_004_010, ..
+            } => "QQ_PERMISSION_DENIED",
+            Self::Native {
+                code: 2_004_000, ..
+            } => "QQ_HISTORY_BOUNDARY_UNCONFIRMED",
+            Self::Native {
+                code: 2_004_007 | -2,
+                ..
+            } => "QQ_RETRY_EXHAUSTED",
+            Self::PartialPage { error, .. } => error.error_code(),
+            _ => "FETCH_FAILED",
+        }
+    }
+
     /// 判断错误是否属于 API 超时（TS `isTimeoutError`）。
     fn is_timeout(&self) -> bool {
         match self {
@@ -759,15 +787,37 @@ impl BatchMessageFetcher {
         // issue #716：原生错误（GeneralCallResult.result != 0）与无效响应必须
         // 显式失败，不能再像空页一样按页宽跳过而静默丢消息。
         let mut messages = extract_msg_page_strict(&result).map_err(FetchError::Api)?;
+        if messages.is_empty() && anchor.is_some() {
+            return Err(FetchError::Native {
+                code: 2_004_000,
+                message: "空页未能确认历史边界，保留当前锚点，未跳过区间".to_string(),
+            });
+        }
 
         // issue #716：满页时页尾边界 msgSeq 可能只返回了部分记录（count 限制
         // 的是记录条数，同一 msgSeq 可混有系统提示与普通消息）。先做包含式
         // 补读，再允许锚点推进到 min(msgSeq) - 1。
         let mut backfilled_boundary = None;
         if messages.len() as i64 >= page {
-            if let Some(backfill) = self.backfill_seq_boundary(peer, &messages).await? {
-                messages.extend(backfill.messages);
-                backfilled_boundary = Some(backfill.boundary_seq);
+            match self.backfill_seq_boundary(peer, &messages).await {
+                Ok(Some(backfill)) => {
+                    messages.extend(backfill.messages);
+                    backfilled_boundary = Some(backfill.boundary_seq);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let resume_seq = messages
+                        .iter()
+                        .filter_map(loose_msg_seq)
+                        .min()
+                        .map(|seq| seq.to_string())
+                        .unwrap_or_default();
+                    return Err(FetchError::PartialPage {
+                        messages: apply_client_side_filter(messages, filter),
+                        resume_seq,
+                        error: Box::new(error),
+                    });
+                }
             }
         }
 
@@ -946,6 +996,9 @@ impl BatchMessageFetcher {
             .await;
             drop(gate_permit);
             let result = match call_result {
+                Ok(Ok(value)) if native_query_error(&value).is_some() => {
+                    native_query_error(&value).expect("native error was checked")
+                }
                 Ok(Ok(value)) => {
                     tracing::info!("[BatchMessageFetcher] API调用成功");
                     let mut state = self.state.lock().await;
@@ -982,6 +1035,13 @@ impl BatchMessageFetcher {
                 state.stats.consecutive_failures += 1;
             }
 
+            // Permission errors and an unconfirmed history boundary must not be
+            // retried indefinitely or converted to empty successful pages.
+            if matches!(&result, FetchError::Native { code, .. } if !matches!(code, 2_004_007 | -2))
+            {
+                return Err(result);
+            }
+
             // issue #634：bridge / Worker 崩溃属于可恢复状态：等待 NapCat 重启
             // 并重新登录后从当前游标继续，不计入普通重试次数。
             if result.is_bridge_down() {
@@ -1007,7 +1067,24 @@ impl BatchMessageFetcher {
             // issue #305 / #316：超时类错误下次重试用更小的 batchSize。
             // issue #634：本地超时不代表 Worker 内旧查询已结束，先冷却再等
             // bridge 健康，避免重量级查询在 Worker 内叠加。
-            if result.is_timeout() {
+            if matches!(result, FetchError::Native { .. }) {
+                let mut state = self.state.lock().await;
+                let old = state.batch_size;
+                state.batch_size = if old > 100 { 100 } else { old.clamp(1, 20) };
+                state.consecutive_successes = 0;
+                let next = state.batch_size;
+                drop(state);
+                let delay = [2_000, 5_000, 10_000][(attempt.saturating_sub(1) as usize).min(2)]
+                    .max(self.config.retry_interval_ms);
+                // A zero interval is reserved for deterministic unit tests.
+                let delay = if self.config.retry_interval_ms == 0 {
+                    0
+                } else {
+                    delay
+                };
+                tracing::warn!("[BatchMessageFetcher] QQ 业务错误，同一锚点重试，batchSize {old} -> {next}，等待 {delay}ms");
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            } else if result.is_timeout() {
                 self.shrink_batch_size().await;
                 let cooldown =
                     TIMEOUT_COOLDOWN_MS.max(self.config.retry_interval_ms * u64::from(attempt));
@@ -1088,15 +1165,22 @@ impl BatchMessageFetcher {
         let peer = peer.clone();
         let used = Arc::new(AtomicI64::new(1));
         let used_in_call = Arc::clone(&used);
+        let first_attempt = Arc::new(AtomicBool::new(true));
         let value = self
             .call_with_retry(move |batch_size| {
                 let api = Arc::clone(&api);
                 let peer = peer.clone();
                 let used = Arc::clone(&used_in_call);
+                let first_attempt = Arc::clone(&first_attempt);
                 async move {
-                    let count = seq_page_size(batch_size)
-                        .clamp(SEQ_BOUNDARY_BACKFILL_MIN_COUNT, GROUP_SEQ_PAGE_MAX);
+                    let count = if first_attempt.swap(false, Ordering::SeqCst) {
+                        seq_page_size(batch_size)
+                            .clamp(SEQ_BOUNDARY_BACKFILL_MIN_COUNT, GROUP_SEQ_PAGE_MAX)
+                    } else {
+                        seq_page_size(batch_size)
+                    };
                     used.store(count, Ordering::SeqCst);
+                    tracing::info!("[BatchMessageFetcher] 边界补读 {query:?}, count={count}");
                     match query {
                         SeqBackfillQuery::Seq(seq) => {
                             api.get_msgs_by_seq_and_count(&peer, seq, count).await
@@ -1286,15 +1370,29 @@ struct SeqBoundaryBackfill {
 /// NapCat 原生调用返回 `GeneralCallResult { result: 0 | -1, errMsg }`，
 /// 业务错误不抛异常而是 `result = -1`；`msgList` 可能在顶层或包一层
 /// `result` 对象内（与 `extract_msg_list` 的两种形状一致）。
+fn native_query_error(value: &Value) -> Option<FetchError> {
+    let native = value
+        .get("result")
+        .filter(|inner| inner.is_object())
+        .unwrap_or(value);
+    let code = match native.get("result")? {
+        Value::Number(number) => number.as_i64()?,
+        Value::String(number) => number.parse().ok()?,
+        _ => return None,
+    };
+    (code != 0).then(|| FetchError::Native {
+        code,
+        message: native
+            .get("errMsg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+    })
+}
+
 fn extract_msg_page_strict(api_result: &Value) -> Result<Vec<Value>, String> {
-    if let Some(code) = api_result.get("result").and_then(Value::as_i64) {
-        if code != 0 {
-            let detail = api_result
-                .get("errMsg")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(format!("原生消息查询失败 result={code}: {detail}"));
-        }
+    if let Some(error) = native_query_error(api_result) {
+        return Err(error.to_string());
     }
     let candidates = [
         api_result.get("msgList"),
@@ -1713,6 +1811,78 @@ mod tests {
                 .expect("call succeeds");
         }
         assert_eq!(fetcher.state.lock().await.batch_size, 5000);
+    }
+
+    #[tokio::test]
+    async fn native_business_errors_retry_with_smaller_windows() {
+        let fetcher = BatchMessageFetcher::new(
+            Arc::new(NoopApi),
+            BatchFetchConfig {
+                retry_interval_ms: 0,
+                ..BatchFetchConfig::default()
+            },
+        );
+        let counts = Mutex::new(Vec::new());
+        let value = fetcher
+            .call_with_retry(|count| {
+                let attempt = {
+                    let mut counts = counts.lock().unwrap();
+                    counts.push(count);
+                    counts.len()
+                };
+                async move {
+                    Ok(if attempt < 3 {
+                        json!({"result":2_004_007,"errMsg":"reach max retry time limit!"})
+                    } else {
+                        json!({"result":0,"msgList":[]})
+                    })
+                }
+            })
+            .await
+            .expect("temporary business error should recover");
+        assert_eq!(counts.into_inner().unwrap(), vec![5000, 100, 20]);
+        assert_eq!(value["result"], 0);
+    }
+
+    #[tokio::test]
+    async fn native_permission_and_boundary_errors_are_not_empty_successes() {
+        for code in [2_004_010, 2_004_000] {
+            let fetcher = BatchMessageFetcher::new(
+                Arc::new(NoopApi),
+                BatchFetchConfig {
+                    retry_interval_ms: 0,
+                    ..BatchFetchConfig::default()
+                },
+            );
+            let calls = AtomicI64::new(0);
+            let error = fetcher.call_with_retry(|_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(json!({"result":{"result":code.to_string(),"errMsg":"native","msgList":[]}})) }
+            }).await.expect_err("native error must fail explicitly");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(matches!(error, FetchError::Native { code: actual, .. } if actual == code));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_retry_exhaustion_is_bounded() {
+        let fetcher = BatchMessageFetcher::new(
+            Arc::new(NoopApi),
+            BatchFetchConfig {
+                retry_interval_ms: 0,
+                ..BatchFetchConfig::default()
+            },
+        );
+        let calls = AtomicI64::new(0);
+        let error = fetcher
+            .call_with_retry(|_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(json!({"result":2_004_007,"errMsg":"busy"})) }
+            })
+            .await
+            .expect_err("must stop after bounded retries");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(error.error_code(), "QQ_RETRY_EXHAUSTED");
     }
 
     /// issue #666：合成的连续群聊历史（seq 1..=`latest_seq`，每条相隔 `step_ms`）。
@@ -2325,11 +2495,20 @@ mod tests {
         let mut previous = None;
         let mut ids = Vec::new();
         let mut batches = 0;
-        while let Some(batch) = fetcher
-            .fetch_next_batch(peer, filter, previous.as_ref())
-            .await
-            .expect("batch")
-        {
+        loop {
+            let batch = match fetcher
+                .fetch_next_batch(peer, filter, previous.as_ref())
+                .await
+            {
+                Ok(Some(batch)) => batch,
+                // These fixtures verify boundary records, not a confirmed
+                // server history tail. An empty synthetic tail is explicit.
+                Ok(None)
+                | Err(FetchError::Native {
+                    code: 2_004_000, ..
+                }) => break,
+                Err(error) => panic!("unexpected boundary error: {error}"),
+            };
             for msg in &batch.messages {
                 if let Some(id) = msg.get("msgId").and_then(Value::as_str) {
                     ids.push(id.to_string());
@@ -2493,11 +2672,18 @@ mod tests {
         let mut previous = Some(first);
         let mut ids: Vec<String> = Vec::new();
         let mut batches = 0;
-        while let Some(batch) = fetcher
-            .fetch_next_batch(&group_peer(), &filter, previous.as_ref())
-            .await
-            .expect("batch")
-        {
+        loop {
+            let batch = match fetcher
+                .fetch_next_batch(&group_peer(), &filter, previous.as_ref())
+                .await
+            {
+                Ok(Some(batch)) => batch,
+                Ok(None)
+                | Err(FetchError::Native {
+                    code: 2_004_000, ..
+                }) => break,
+                Err(error) => panic!("unexpected boundary error: {error}"),
+            };
             for msg in &batch.messages {
                 if let Some(id) = msg.get("msgId").and_then(Value::as_str) {
                     ids.push(id.to_string());
@@ -2558,7 +2744,12 @@ mod tests {
             let result = fetcher
                 .fetch_next_batch(&group_peer(), &MessageFilter::default(), None)
                 .await;
-            assert!(result.is_err(), "补读失败必须显式返回错误而不是当空页跳过");
+            let error = result.expect_err("补读失败必须显式返回错误而不是当空页跳过");
+            assert!(
+                matches!(error, FetchError::PartialPage { messages, resume_seq, .. }
+                if messages.len() == 5 && resume_seq == "500"),
+                "正常分页消息及边界必须保留"
+            );
         }
 
         // 底层 API 错误。
@@ -2590,7 +2781,7 @@ mod tests {
             .await;
         let err = result.expect_err("超过补读上限必须显式失败");
         assert!(
-            matches!(err, FetchError::SequenceBackfillExhausted { .. }),
+            matches!(&err, FetchError::PartialPage { error, .. } if matches!(error.as_ref(), FetchError::SequenceBackfillExhausted { .. })),
             "unexpected error: {err}"
         );
     }

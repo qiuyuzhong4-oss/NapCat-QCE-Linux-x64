@@ -50,8 +50,8 @@ use crate::clean_message_spool::{CleanMessageSpool, SpooledCleanMessageSource};
 use crate::export_debug::ExportDebugSession;
 use crate::fetcher::{
     acquire_history_query_permit, chat_type_prefix, classify_chat_type_binary,
-    repair_group_message_sequence, BatchFetchConfig, BatchMessageFetcher, MessageFilter, Peer,
-    SequenceRepairConfig, GROUP_CHAT_TYPE,
+    repair_group_message_sequence, BatchFetchConfig, BatchMessageFetcher, FetchError,
+    MessageFilter, Peer, SequenceRepairConfig, GROUP_CHAT_TYPE,
 };
 use crate::parser::simple_parser::ReplyImageIndex;
 use crate::parser::{ForwardFetcher, SimpleMessageParser, SimpleParserOptions};
@@ -1117,6 +1117,82 @@ struct ExportRequest {
     use_friendly_file_name: bool,
     date_str: String,
     time_str: String,
+    account_key: String,
+    resume: Option<ResumeCheckpoint>,
+}
+
+struct ResumeCheckpoint {
+    task_id: String,
+    path: PathBuf,
+    cursor: Value,
+}
+
+async fn prepare_resume_checkpoint(
+    state: &SharedState,
+    body: &Value,
+    peer_uid: &str,
+    filter: &Value,
+    output_dir: &FsPath,
+    account_key: &str,
+) -> Result<Option<ResumeCheckpoint>, ApiError> {
+    let Some(id) = body.get("resumeTaskId") else {
+        return Ok(None);
+    };
+    let id = id
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+        .ok_or_else(|| ApiError::validation("续传任务 ID 无效", "INVALID_RESUME_TASK"))?;
+    let old = state
+        .export_tasks
+        .lock()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| ApiError::validation("续传任务不存在", "INVALID_RESUME_TASK"))?;
+    let cursor = old
+        .get("fetchCheckpoint")
+        .filter(|v| v.get("version").and_then(Value::as_u64) == Some(1))
+        .ok_or_else(|| ApiError::validation("此任务没有可续传检查点", "INVALID_RESUME_TASK"))?;
+    if !matches!(
+        old.get("status").and_then(Value::as_str),
+        Some("failed" | "cancelled")
+    ) || old.pointer("/peer/chatType").and_then(Value::as_i64) != Some(GROUP_CHAT_TYPE)
+        || old.pointer("/peer/peerUid").and_then(Value::as_str) != Some(peer_uid)
+        || old.get("filter") != Some(filter)
+        || account_key.is_empty()
+        || cursor.get("accountKey").and_then(Value::as_str) != Some(account_key)
+    {
+        return Err(ApiError::validation(
+            "续传要求同一账号、群、时间筛选和已结束任务",
+            "INVALID_RESUME_TASK",
+        ));
+    }
+    let expected = output_dir.join(format!(".qce_spool_{id}.jsonl"));
+    let path = crate::api::path_security::resolve_existing_descendant_within(
+        &expected,
+        &[output_dir.to_path_buf()],
+    )
+    .filter(|p| p.is_file())
+    .ok_or_else(|| {
+        ApiError::validation("续传暂存文件不存在或不在输出目录内", "INVALID_RESUME_PATH")
+    })?;
+    if old.get("partialRawPath").and_then(Value::as_str) != path.to_str() {
+        return Err(ApiError::validation(
+            "续传输出目录与原任务不一致",
+            "INVALID_RESUME_PATH",
+        ));
+    }
+    Ok(Some(ResumeCheckpoint {
+        task_id: id.to_string(),
+        path,
+        cursor: cursor.clone(),
+    }))
 }
 
 async fn prepare_output_directory(
@@ -1209,6 +1285,27 @@ async fn prepare_export_request(
         (!custom_output_dir.trim().is_empty()).then_some(custom_output_dir.as_str()),
     );
     let output_dir = prepare_output_directory(&requested_output_dir, &output_roots).await?;
+    let account_key = state
+        .napcat
+        .self_info()
+        .await
+        .ok()
+        .and_then(|info| {
+            info.get("uid")
+                .or_else(|| info.get("uin"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if body.get("resumeTaskId").is_some() && chat_type != GROUP_CHAT_TYPE {
+        return Err(ApiError::validation(
+            "当前仅支持群聊检查点续传",
+            "INVALID_RESUME_TASK",
+        ));
+    }
+    let resume =
+        prepare_resume_checkpoint(state, body, &peer_uid, &filter, &output_dir, &account_key)
+            .await?;
 
     // 会话名：优先用户输入（issue #365）。
     let user_session_name = body
@@ -1238,6 +1335,8 @@ async fn prepare_export_request(
         output_dir,
         date_str,
         time_str,
+        account_key,
+        resume,
     })
 }
 
@@ -1328,6 +1427,7 @@ pub async fn export_messages(
         "format": format,
         "filter": req.filter,
         "options": req.options,
+        "resumedFrom": req.resume.as_ref().map(|resume| &resume.task_id),
     });
     if !register_task(&state, &task).await {
         let err = ApiError::new(
@@ -1931,6 +2031,9 @@ async fn run_export_task(
     }
 
     // issue #446：清理停止任务的跟踪状态。
+    if let Err(error) = state.db.flush_write_queue().await {
+        tracing::warn!("[ApiServer] 刷新任务终态失败: {error}");
+    }
     {
         let mut flags = state.running_export_cancel_flags.lock().await;
         flags.remove(&task_id);
@@ -2169,11 +2272,12 @@ async fn create_zip_from_dir(dir: PathBuf, zip_path: PathBuf) -> Result<(), Stri
 const RAW_SPOOL_CHUNK_SIZE: usize = 20_000;
 
 /// issue #634：抓取阶段的磁盘 spool。原始消息逐批落盘为 JSONL，避免在内存
-/// 中累积超大群聊的全部原始消息；任何退出路径（Drop）都会清理文件。
+/// 中累积超大群聊的全部原始消息。可续传任务失败时保留文件。
 struct RawMessageSpool {
     path: PathBuf,
     writer: Option<tokio::io::BufWriter<tokio::fs::File>>,
     count: usize,
+    preserve: bool,
 }
 
 impl RawMessageSpool {
@@ -2185,6 +2289,7 @@ impl RawMessageSpool {
             path,
             writer: Some(tokio::io::BufWriter::new(file)),
             count: 0,
+            preserve: false,
         })
     }
 
@@ -2220,6 +2325,19 @@ impl RawMessageSpool {
         Ok(())
     }
 
+    async fn flush_checkpoint(&mut self) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt as _;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush().await.map_err(|error| error.to_string())?;
+            writer
+                .get_ref()
+                .sync_data()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn path(&self) -> &FsPath {
         &self.path
     }
@@ -2232,8 +2350,37 @@ impl RawMessageSpool {
 impl Drop for RawMessageSpool {
     fn drop(&mut self) {
         self.writer.take();
-        let _ = std::fs::remove_file(&self.path);
+        if !self.preserve {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+async fn save_fetch_checkpoint(
+    state: &SharedState,
+    task_id: &str,
+    spool: &mut RawMessageSpool,
+    cursor: &Value,
+) -> Result<(), String> {
+    spool.flush_checkpoint().await?;
+    update_task(
+        state,
+        task_id,
+        json!({
+            "fetchCheckpoint": cursor,
+            "partialRawPath": spool.path().to_string_lossy(),
+            "partialMessageCount": spool.count(),
+            "partialDataAvailable": spool.count() > 0,
+            "messageCount": spool.count(),
+        }),
+    )
+    .await
+    .ok_or_else(|| "任务已删除，无法保存检查点".to_string())?;
+    state
+        .db
+        .flush_write_queue()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 按块读取 spool JSONL。
@@ -2353,6 +2500,7 @@ async fn process_export_task(
         .map_err(|e| format!("创建输出目录失败: {e}"))?;
     let mut spool =
         RawMessageSpool::create(req.output_dir.join(format!(".qce_spool_{task_id}.jsonl"))).await?;
+    spool.preserve = matches!(&input, ExportInput::Standard);
     match input {
         ExportInput::Standard => {
             let batch_size = loose_i64(req.options.get("batchSize")).unwrap_or(5000);
@@ -2372,14 +2520,49 @@ async fn process_export_task(
             };
             let start_time_ms =
                 normalize_to_ms(loose_i64(req.filter.get("startTime")).unwrap_or(0));
-            let end_time_ms =
+            let mut end_time_ms =
                 normalize_to_ms(loose_i64(req.filter.get("endTime")).unwrap_or_else(now_ms));
+            if let Some(resume) = &req.resume {
+                end_time_ms = resume
+                    .cursor
+                    .get("endTimeMs")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "续传检查点缺少结束时间".to_string())?;
+                let mut reader = SpoolChunkReader::open(&resume.path, RAW_SPOOL_CHUNK_SIZE).await?;
+                while let Some(chunk) = reader.next_chunk().await? {
+                    spool.append(&chunk).await?;
+                }
+            }
             let fetch_filter = MessageFilter {
                 start_time: Some(start_time_ms),
                 end_time: Some(end_time_ms),
                 ..MessageFilter::default()
             };
-            let mut previous = None;
+            let mut cursor = req.resume.as_ref().map_or_else(
+                || {
+                    json!({
+                        "version": 1, "accountKey": req.account_key, "nextSeq": null,
+                        "nextMessageId": null, "fetchComplete": false, "endTimeMs": end_time_ms,
+                    })
+                },
+                |resume| resume.cursor.clone(),
+            );
+            let mut previous = req
+                .resume
+                .as_ref()
+                .map(|_| crate::fetcher::BatchFetchResult {
+                    has_more: cursor.get("fetchComplete").and_then(Value::as_bool) != Some(true),
+                    next_seq: cursor
+                        .get("nextSeq")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    next_message_id: cursor
+                        .get("nextMessageId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    ..crate::fetcher::BatchFetchResult::default()
+                });
+            save_fetch_checkpoint(state, task_id, &mut spool, &cursor).await?;
             let mut batch_count: i64 = 0;
             let mut max_seq_seen: Option<i64> = None;
             let mut min_seq_seen: Option<i64> = None;
@@ -2398,8 +2581,30 @@ async fn process_export_task(
                 };
                 let mut batch = match fetch_result {
                     Ok(Some(batch)) => batch,
-                    Ok(None) => break,
-                    Err(error) => return Err(format!("获取消息失败: {error}")),
+                    Ok(None) => {
+                        cursor["fetchComplete"] = json!(true);
+                        save_fetch_checkpoint(state, task_id, &mut spool, &cursor).await?;
+                        break;
+                    }
+                    Err(error) => {
+                        if let FetchError::PartialPage {
+                            messages,
+                            resume_seq,
+                            ..
+                        } = &error
+                        {
+                            spool.append(messages).await?;
+                            cursor["nextSeq"] = json!(resume_seq);
+                            cursor["fetchComplete"] = json!(false);
+                        }
+                        save_fetch_checkpoint(state, task_id, &mut spool, &cursor).await?;
+                        let _ = update_task(state, task_id, json!({
+                            "errorCode": error.error_code(),
+                            "failureStage": if matches!(&error, FetchError::PartialPage { .. }) { "boundary_backfill" } else { "history_page" },
+                            "message": format!("导出未完成，已保留 {} 条原始记录，可从检查点重试", spool.count()),
+                        })).await;
+                        return Err(format!("获取消息失败: {error}"));
+                    }
                 };
                 batch_count += 1;
                 for message in &batch.messages {
@@ -2410,6 +2615,10 @@ async fn process_export_task(
                     min_seq_seen = Some(min_seq_seen.map_or(seq, |value| value.min(seq)));
                 }
                 spool.append(&batch.messages).await?;
+                cursor["nextSeq"] = json!(batch.next_seq);
+                cursor["nextMessageId"] = json!(batch.next_message_id);
+                cursor["fetchComplete"] = json!(!batch.has_more);
+                save_fetch_checkpoint(state, task_id, &mut spool, &cursor).await?;
                 batch.messages = Vec::new();
 
                 let progress = estimate_fetch_progress(max_seq_seen, min_seq_seen, batch_count);
@@ -2728,7 +2937,6 @@ async fn process_export_task(
         .await;
     }
     drop(reader);
-    drop(spool);
     clean_spool.finish().await?;
     drop(parsed_message_ids);
     drop(resource_message_ids);
@@ -3156,6 +3364,9 @@ async fn process_export_task(
                 .as_ref()
                 .map_or(Value::Null, |p| Value::String(p.to_string_lossy().to_string())),
             "resourceSummary": resource_summary_value.clone().unwrap_or(Value::Null),
+            "partialDataAvailable": false,
+            "partialRawPath": null,
+            "fetchCheckpoint": null,
             "debugPath": debug_path
                 .as_ref()
                 .map_or(Value::Null, |path| Value::String(path.to_string_lossy().to_string())),
@@ -3163,6 +3374,7 @@ async fn process_export_task(
     )
     .await;
 
+    let completed = completed_task.is_some();
     if let Some(completed_task) = completed_task {
         state.broadcast_ws(&export_ws_event(
             "export_complete",
@@ -3197,6 +3409,9 @@ async fn process_export_task(
     {
         let mut cache = state.resource_file_cache.lock().await;
         cache.clear();
+    }
+    if completed {
+        spool.preserve = false;
     }
     Ok(())
 }
@@ -3599,6 +3814,111 @@ mod task_queue_tests {
             port: 0,
         });
         (state, temp)
+    }
+
+    #[tokio::test]
+    async fn failed_spool_survives_and_resume_checks_identity_and_path() {
+        let (state, temp) = create_test_state().await;
+        let output = temp.canonicalize().unwrap();
+        let path = output.join(".qce_spool_resume_fixture.jsonl");
+        let filter = json!({"startTime": 1, "endTime": 100});
+        state.export_tasks.lock().await.insert("resume_fixture".to_string(), json!({
+            "taskId":"resume_fixture", "status":"running", "peer":{"chatType":2,"peerUid":"123"}, "filter":filter,
+        }));
+        let mut spool = RawMessageSpool::create(path.clone()).await.unwrap();
+        spool.preserve = true;
+        spool
+            .append(&[json!({"msgId":"one","msgSeq":"10"})])
+            .await
+            .unwrap();
+        save_fetch_checkpoint(&state, "resume_fixture", &mut spool, &json!({
+            "version":1,"accountKey":"account-a","nextSeq":"10","fetchComplete":false,"endTimeMs":100,
+        })).await.unwrap();
+        drop(spool);
+        assert!(
+            path.is_file(),
+            "failed export must retain durable raw messages"
+        );
+        let mut reader = SpoolChunkReader::open(&path, 10).await.unwrap();
+        assert_eq!(reader.next_chunk().await.unwrap().unwrap().len(), 1);
+        update_task(&state, "resume_fixture", json!({"status":"failed"})).await;
+        let body = json!({"resumeTaskId":"resume_fixture"});
+        let resumed =
+            prepare_resume_checkpoint(&state, &body, "123", &filter, &output, "account-a")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(resumed.cursor["nextSeq"], "10");
+        assert!(
+            prepare_resume_checkpoint(&state, &body, "123", &filter, &output, "account-b")
+                .await
+                .is_err()
+        );
+        assert!(
+            prepare_resume_checkpoint(&state, &body, "456", &filter, &output, "account-a")
+                .await
+                .is_err()
+        );
+        assert!(
+            prepare_resume_checkpoint(&state, &body, "123", &json!({}), &output, "account-a")
+                .await
+                .is_err()
+        );
+        assert!(prepare_resume_checkpoint(
+            &state,
+            &json!({"resumeTaskId":"../resume_fixture"}),
+            "123",
+            &filter,
+            &output,
+            "account-a"
+        )
+        .await
+        .is_err());
+        update_task(&state, "resume_fixture", json!({"status":"running"})).await;
+        assert!(
+            prepare_resume_checkpoint(&state, &body, "123", &filter, &output, "account-a")
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn completed_spool_is_removed_only_after_success() {
+        let path =
+            std::env::temp_dir().join(format!("qce-spool-success-{}.jsonl", uuid::Uuid::new_v4()));
+        let mut spool = RawMessageSpool::create(path.clone()).await.unwrap();
+        spool.preserve = true;
+        spool.append(&[json!({"msgId":"one"})]).await.unwrap();
+        spool.finish().await.unwrap();
+        assert!(path.is_file());
+        spool.preserve = false;
+        drop(spool);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_interrupted_checkpoint_even_without_legacy_progress_fields() {
+        let temp = std::env::temp_dir().join(format!(
+            "qce-interrupted-checkpoint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp).await.unwrap();
+        let db = Arc::new(crate::storage::DatabaseManager::new(&temp.join("qce.db")));
+        db.initialize().await.unwrap();
+        let task = json!({"taskId":"interrupted", "status":"running", "messageCount":5,
+            "fetchCheckpoint":{"version":1,"nextSeq":"8"}});
+        db.save_task(&task, &task, true).await.unwrap();
+        db.flush_write_queue().await.unwrap();
+        let restarted = Arc::new(crate::storage::DatabaseManager::new(&temp.join("qce.db")));
+        restarted.initialize().await.unwrap();
+        let loaded = restarted
+            .load_task("interrupted")
+            .await
+            .unwrap()
+            .expect("checkpoint task must survive startup cleanup");
+        assert_eq!(loaded.1["fetchCheckpoint"]["nextSeq"], "8");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]

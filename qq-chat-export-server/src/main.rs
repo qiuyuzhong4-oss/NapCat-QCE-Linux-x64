@@ -611,7 +611,12 @@ async fn reconcile_and_load_tasks(db: &Arc<DatabaseManager>) -> HashMap<String, 
                 .is_some_and(|e| !e.is_empty());
             merged.insert("status".to_string(), json!("failed"));
             if !has_error {
-                merged.insert("error".to_string(), json!(ORPHAN_TASK_ERROR_MESSAGE));
+                let message = if merged.contains_key("fetchCheckpoint") {
+                    "服务上次运行被中断，已保留检查点和原始记录，可续传"
+                } else {
+                    ORPHAN_TASK_ERROR_MESSAGE
+                };
+                merged.insert("error".to_string(), json!(message));
             }
             normalize_orphan_roaming_scan(&mut merged);
             let reconciled = Value::Object(merged.clone());
